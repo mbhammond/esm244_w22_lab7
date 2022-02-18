@@ -1,0 +1,133 @@
+---
+title: "beepboop"
+output: html_document
+---
+
+```{r setup, include=TRUE, message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(here)
+library(sf)
+library(tmap)
+library(gstat)
+library(stars)
+```
+
+### Read in CA map and groundwater depth data
+
+```{r}
+ca_counties_sf_k <- read_sf(here('data/ca_counties'),
+                          layer = 'CA_Counties_TIGER2016') %>% 
+  janitor::clean_names() %>% 
+  select(name)
+
+### check projection
+st_crs(ca_counties_sf_k)
+
+
+### read in groundwater depth data
+ca_dgw_sf_k <- read_sf(here('data/ca_dgw',
+                            'F2013_DBGS_Points_20150720_093252.gpkg')) %>% 
+  janitor::Clean_names()
+
+st_crs(ca_dgw_sf_k)
+
+ca_dgw_sf_k <- st_transform(ca_dgw_sf_k, st_crs(ca_counties_sf_k))
+
+ggplot() +
+  geom_sf(data = ca_counties_sf_k) +
+  geom_sf(data = ca_dgw_sf_k, aes(color = dgbs))
+```
+
+```{r}
+tmap_mode(mode = 'view')
+
+tm_shape(ca_dgw_sf_k) +
+  tm_dots('dgbs', palette = 'Blues')
+# tmaptools::palette_explorer() ### need shinyjs package
+```
+
+Clip to San Joaquin county
+
+```{r}
+sj_county_sf_k <- ca_counties_sf_k %>% 
+  filter(name == 'San Joaquin')
+
+### now keep observations for groundwater depth in that county:
+
+sj_depth_sf_k <- ca_dgw_sf_k %>% 
+  st_intersection(sj_county_sf_k)
+
+ggplot() +
+  geom_sf(data = sj_county_sf_k) +
+  geom_sf(data = sj_depth_sf_k, aes(color = dgbs)) +
+  theme_void() +
+  scale_color_viridis_c()
+
+```
+
+### Check for duplicate locations
+
+```{r}
+well_duplicates <- sj_depth_sf_k %>% 
+  janitor::get_dupes(latitude, longitude)
+
+sj_depth_sf_k <- sj_depth_sf_k %>% 
+  filter(!local_well %in% well_duplicates$local_well)
+
+```
+
+
+### Create a variogram!
+
+```{r}
+sj_dwg_vgm <- gstat::variogram(dgbs ~ 1,
+                                data = sj_depth_sf_k)
+
+plot(sj_dwg_vgm)
+```
+
+
+```{r}
+### create the variogram model
+sj_dwg_vgm_fit <- fit.variogram(sj_dwg_vgm,
+                                model = vgm(model = 'Gau',
+                                            nugget = 20,
+                                            sill = 3000,
+                                            range = 32000))
+
+plot(sj_dwg_vgm, sj_dwg_vgm_fit)
+attr(sj_dwg_vgm_fit, 'SSErr')
+```
+
+## Spatial kriging
+
+```{r}
+sj_grid <- st_bbox(sj_county_sf_k) %>% 
+  st_as_stars(dx = 1000,
+              dy = 1000) %>% 
+  st_set_crs(st_crs(sj_county_sf_k)) %>% 
+  st_crop(sj_county_sf_k)
+
+plot(sj_grid)
+
+### perform ordinary kriging
+sj_dwg_krige <- krige(dgbs ~ 1,
+                      sj_depth_sf_k, 
+                      sj_grid,
+                      model = sj_dwg_vgm_fit)
+
+plot(sj_dwg_krige)
+
+krige_df <- as.data.frame(sj_dwg_krige) %>% 
+  st_as_sf(coords = c('x', 'y')) %>% 
+  drop_na(var1.pred)
+
+ggplot(data = krige_df) +
+  geom_sf(aes(color = var1.pred)) +
+  scale_color_gradient(low = 'blue', high = 'yellow')
+```
+
+
+
+
